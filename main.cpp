@@ -113,7 +113,7 @@ bool isPdf(const std::string &e) { return e == "pdf"; }
 bool isKnownTextFile(const std::string &name) {
     std::string n = name;
     std::transform(n.begin(), n.end(), n.begin(), ::tolower);
-    return n == "makefile" || n == "gnumakefile" || n == "readme" || n == "license" || n == "copying" || n == "todo" || n == "changelog" || n == "install" || n == "news" || n == "authors" || n == "contributing" || n == "security" || n == "codeowners";
+    return n == "makefile" || n == ".gitignore" || n == "gnumakefile" || n == "readme" || n == "license" || n == "copying" || n == "todo" || n == "changelog" || n == "install" || n == "news" || n == "authors" || n == "contributing" || n == "security" || n == "codeowners";
 }
 bool isTextContent(const std::string& path) {
     int fd = open(path.c_str(), O_RDONLY);

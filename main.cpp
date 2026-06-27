@@ -13,6 +13,14 @@
 #include <sys/sendfile.h>
 #include <charconv>
 #include <cstring>
+#include <ctime>
+#include <cstdio>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
+#include <unordered_map>
 
 struct Entry {
     std::string name;
@@ -20,6 +28,8 @@ struct Entry {
     bool dir = false;
     bool exec = false;
     bool link = false;
+    off_t size = 0;
+    time_t mtime = 0;
     // --- Precomputed Cache ---
     std::string ext;
     bool isText = false;
@@ -57,9 +67,21 @@ int rows = 0;
 int cols = 0;
 bool running = true;
 bool commandMode = false;
+bool helpMode = false; 
 std::string command;
-bool force_redraw = true;
+std::atomic<bool> force_redraw{true}; 
 std::string g_out;
+
+// --- Info Toggles ---
+enum InfoMode { INFO_NONE, INFO_DATE, INFO_SIZE };
+InfoMode infoMode = INFO_NONE;
+
+// --- Background Worker State ---
+std::unordered_map<std::string, off_t> dirSizeCache;
+std::mutex sizeMutex;
+std::queue<std::string> sizeQueue;
+std::condition_variable sizeCv;
+std::atomic<bool> workerRunning{true};
 
 // --- Text Preview Cache ---
 std::string cached_preview_path;
@@ -105,6 +127,101 @@ std::string extension(const std::string &name) {
     return ext;
 }
 
+std::string formatSize(off_t size) {
+    const char* units[] = {"B", "K", "M", "G", "T"};
+    int u = 0;
+    double s = size;
+    while (s >= 1024.0 && u < 4) {
+        s /= 1024.0;
+        u++;
+    }
+    char buf[32];
+    if (u == 0) snprintf(buf, sizeof(buf), "%d%s", (int)s, units[u]);
+    else snprintf(buf, sizeof(buf), "%.1f%s", s, units[u]);
+    return buf;
+}
+
+std::string formatDate(time_t mtime) {
+    char buf[64];
+    struct tm *tm_info = localtime(&mtime);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", tm_info);
+    return buf;
+}
+
+// --- Recursive Size Calculation (Thread Safe) ---
+off_t getDirectorySizeRec(std::string &path_buf) {
+    DIR *dir = opendir(path_buf.c_str());
+    if (!dir) return 0;
+    
+    off_t totalSize = 0;
+    struct dirent *d;
+    size_t orig_len = path_buf.size();
+    
+    while ((d = readdir(dir))) {
+        if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, "..")) continue;
+        
+        path_buf.push_back('/');
+        path_buf.append(d->d_name);
+        
+        if (path_buf == "/proc" || path_buf == "/sys" || path_buf == "/dev" || path_buf == "/run") {
+            path_buf.resize(orig_len);
+            continue;
+        }
+        
+        struct stat st;
+        if (lstat(path_buf.c_str(), &st) == 0) {
+            totalSize += st.st_size;
+            if (S_ISDIR(st.st_mode)) {
+                totalSize += getDirectorySizeRec(path_buf);
+            }
+        }
+        path_buf.resize(orig_len); 
+    }
+    closedir(dir);
+    return totalSize;
+}
+
+// Hilo secundario para cálculo pesado sin bloquear la UI
+void sizeWorkerThread() {
+    while (workerRunning) {
+        std::string path;
+        {
+            std::unique_lock<std::mutex> lock(sizeMutex);
+            sizeCv.wait(lock, []{ return !sizeQueue.empty() || !workerRunning; });
+            if (!workerRunning && sizeQueue.empty()) break;
+            path = sizeQueue.front();
+            sizeQueue.pop();
+        }
+        
+        std::string buf;
+        buf.reserve(PATH_MAX);
+        buf = path;
+        off_t total = getDirectorySizeRec(buf);
+        
+        {
+            std::lock_guard<std::mutex> lock(sizeMutex);
+            dirSizeCache[path] = total;
+        }
+        force_redraw = true; // Despertar a la UI
+    }
+}
+
+std::string getEntrySizeString(const Entry& e) {
+    if (!e.dir) return formatSize(e.size);
+    
+    std::lock_guard<std::mutex> lock(sizeMutex);
+    if (dirSizeCache.count(e.path)) {
+        off_t s = dirSizeCache[e.path];
+        if (s == -1) return ".....";
+        return formatSize(s + e.size); 
+    } else {
+        dirSizeCache[e.path] = -1; 
+        sizeQueue.push(e.path);
+        sizeCv.notify_one();
+        return "Calculando...";
+    }
+}
+
 bool isImage(const std::string &e) { return e == "png" || e == "jpg" || e == "jpeg" || e == "bmp" || e == "gif" || e == "webp"; }
 bool isText(const std::string &e) { return e == "txt" || e == "cpp" || e == "hpp" || e == "c" || e == "h" || e == "cc" || e == "hh" || e == "md" || e == "json" || e == "toml" || e == "yaml" || e == "yml" || e == "ini" || e == "conf" || e == "sh"; }
 bool isAudio(const std::string &e) { return e == "mp3" || e == "ogg" || e == "wav" || e == "flac"; }
@@ -113,43 +230,17 @@ bool isPdf(const std::string &e) { return e == "pdf"; }
 bool isKnownTextFile(const std::string &name) {
     std::string n = name;
     std::transform(n.begin(), n.end(), n.begin(), ::tolower);
-    return n == "makefile" || n == ".gitignore" || n == "gnumakefile" || n == "readme" || n == "license" || n == "copying" || n == "todo" || n == "changelog" || n == "install" || n == "news" || n == "authors" || n == "contributing" || n == "security" || n == "codeowners";
+    return n == "makefile" || n == "gnumakefile" || n == "readme" || n == "license" || n == "copying" || n == "todo" || n == "changelog" || n == "install" || n == "news" || n == "authors" || n == "contributing" || n == "security" || n == "codeowners";
 }
-bool isTextContent(const std::string& path) {
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd == -1)
-        return false;
-
-    char buf[8192];
-    ssize_t n = read(fd, buf, sizeof(buf));
-    close(fd);
-
-    if (n <= 0)
-        return false;
-
-    for (ssize_t i = 0; i < n; ++i) {
-        if (buf[i] == '\0')
-            return false;
-    }
-
-    return true;
-}
-
 
 void populatePrecomputed(Entry &e) {
     e.ext = extension(e.name);
     e.isImg = isImage(e.ext);
+    e.isText = isText(e.ext);
     e.isAud = isAudio(e.ext);
     e.isVid = isVideo(e.ext);
     e.isPdfFile = isPdf(e.ext);
     e.isKnownText = isKnownTextFile(e.name);
-    e.isText = isText(e.ext);
-
-// Si no se reconoció por extensión,
-// intenta detectarlo por contenido.
-    if (!e.dir && !e.isImg && !e.isAud && !e.isVid && !e.isPdfFile && !e.isText && !e.isKnownText){
-        e.isText = isTextContent(e.path);
-    }
 }
 
 // --- Render Optimization Utilities ---
@@ -263,12 +354,16 @@ Entry createEntryFromPath(const std::string &path) {
     e.path = path;
     struct stat st;
     if (lstat(path.c_str(), &st) == 0) {
+        e.size = st.st_size;
+        e.mtime = st.st_mtime;
         if (S_ISLNK(st.st_mode)) {
             e.link = true;
             struct stat tgt;
             if (stat(path.c_str(), &tgt) == 0) {
                 e.dir = S_ISDIR(tgt.st_mode);
                 e.exec = (tgt.st_mode & S_IXUSR) && !e.dir;
+                e.size = tgt.st_size;
+                e.mtime = tgt.st_mtime;
             }
         } else {
             e.dir = S_ISDIR(st.st_mode);
@@ -295,7 +390,7 @@ void enableRaw() {
     raw.c_cflag |= CS8;
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
     raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
+    raw.c_cc[VTIME] = 1; 
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
@@ -305,13 +400,15 @@ void updateSize() {
     if (rows != ws.ws_row || cols != ws.ws_col) force_redraw = true;
     rows = ws.ws_row;
     cols = ws.ws_col;
-    if (rows < 6) rows = 6;
+    if (rows < 7) rows = 7; 
     if (cols < 20) cols = 20;
 }
 
 int readKey() {
     char c;
-    while (read(STDIN_FILENO, &c, 1) != 1);
+    while (read(STDIN_FILENO, &c, 1) != 1) {
+        if (force_redraw) return KEY_NULL;
+    }
     if (c == 13) return KEY_ENTER;
     if (c == 127) return KEY_BACKSPACE;
     if (c != 27) return c;
@@ -340,6 +437,8 @@ std::vector<Entry> readDir(const std::string &path) {
     std::vector<Entry> res;
     DIR *dir = opendir(path.c_str());
     if (!dir) return res;
+    
+    res.reserve(4096);
     dirent *d;
     while ((d = readdir(dir))) {
         if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, "..")) continue;
@@ -348,12 +447,16 @@ std::vector<Entry> readDir(const std::string &path) {
         e.path = join(path, e.name);
         struct stat st;
         if (lstat(e.path.c_str(), &st) == 0) {
+            e.size = st.st_size;
+            e.mtime = st.st_mtime;
             if (S_ISLNK(st.st_mode)) {
                 e.link = true;
                 struct stat tgt;
                 if (stat(e.path.c_str(), &tgt) == 0) {
                     e.dir = S_ISDIR(tgt.st_mode);
                     e.exec = (tgt.st_mode & S_IXUSR) && !e.dir;
+                    e.size = tgt.st_size;
+                    e.mtime = tgt.st_mtime;
                 }
             } else {
                 e.dir = S_ISDIR(st.st_mode);
@@ -364,6 +467,53 @@ std::vector<Entry> readDir(const std::string &path) {
         res.push_back(std::move(e));
     }
     closedir(dir);
+    std::sort(res.begin(), res.end(), cmp);
+    return res;
+}
+
+std::vector<Entry> readPreviewDir(const std::string &path, int max_items) {
+    std::vector<Entry> res;
+    DIR *dir = opendir(path.c_str());
+    if (!dir) return res;
+    
+    std::vector<std::string> names;
+    names.reserve(4096);
+    dirent *d;
+    while ((d = readdir(dir))) {
+        if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, "..")) continue;
+        names.push_back(d->d_name);
+    }
+    closedir(dir);
+
+    std::sort(names.begin(), names.end());
+    if (names.size() > (size_t)max_items) names.resize(max_items);
+
+    res.reserve(names.size());
+    for (const auto& name : names) {
+        Entry e;
+        e.name = name;
+        e.path = join(path, name);
+        struct stat st;
+        if (lstat(e.path.c_str(), &st) == 0) {
+            e.size = st.st_size;
+            e.mtime = st.st_mtime;
+            if (S_ISLNK(st.st_mode)) {
+                e.link = true;
+                struct stat tgt;
+                if (stat(e.path.c_str(), &tgt) == 0) {
+                    e.dir = S_ISDIR(tgt.st_mode);
+                    e.exec = (tgt.st_mode & S_IXUSR) && !e.dir;
+                    e.size = tgt.st_size;
+                    e.mtime = tgt.st_mtime;
+                }
+            } else {
+                e.dir = S_ISDIR(st.st_mode);
+                e.exec = (st.st_mode & S_IXUSR) && !e.dir;
+            }
+        }
+        populatePrecomputed(e);
+        res.push_back(std::move(e));
+    }
     std::sort(res.begin(), res.end(), cmp);
     return res;
 }
@@ -408,7 +558,7 @@ void drawPath(std::string &out) {
 }
 
 void drawEntries(std::string &out, bool partial) {
-    int visible = rows - 4;
+    int visible = rows - 5;
     if (selected < scroll) scroll = selected;
     if (selected >= scroll + visible) scroll = selected - visible + 1;
 
@@ -438,7 +588,7 @@ void drawEntries(std::string &out, bool partial) {
     if (multi && !entries.empty() && entries[selected].dir) {
         if (entries[selected].path != childCachePath) {
             childCachePath = entries[selected].path;
-            childEntries = readDir(childCachePath);
+            childEntries = readPreviewDir(childCachePath, rows);
         }
     }
 
@@ -489,14 +639,33 @@ void drawEntries(std::string &out, bool partial) {
 
                 if (i + scroll == selected) out += "\x1b[44;97m";
                 else out += color;
-                appendPadTruncate(out, e.dir ? e.name + "/" : e.name, c_width);
+                
+                std::string extra_info = "";
+                if (infoMode == INFO_SIZE) {
+                    extra_info = getEntrySizeString(e); 
+                } else if (infoMode == INFO_DATE && !e.dir) {
+                    extra_info = formatDate(e.mtime);
+                }
+
+                if (!extra_info.empty() && c_width > (int)extra_info.length() + 2) {
+                    int name_width = c_width - extra_info.length() - 1;
+                    appendPadTruncate(out, e.dir ? e.name + "/" : e.name, name_width);
+                    
+                    if (i + scroll == selected) {
+                        out += " \x1b[35;44m" + extra_info; 
+                    } else {
+                        out += " \x1b[35m" + extra_info;
+                    }
+                } else {
+                    appendPadTruncate(out, e.dir ? e.name + "/" : e.name, c_width);
+                }
                 out += "\x1b[0m";
             } else {
                 out.append(c_width, ' ');
             }
         }
 
-        // Child/Preview Pane (Always refresh on change)
+        // Child/Preview Pane
         if (multi) {
             int r_start = w1 + w2 + 2;
             int r_width = w3 - 2;
@@ -540,7 +709,7 @@ void drawEntries(std::string &out, bool partial) {
         }
     }
 
-    // Text Preview System (Cached to avoid re-reading files on every frame)
+    // Text Preview System (Alineado a 3 dígitos con separador " │ ")
     if (multi && !entries.empty()) {
         auto &e = entries[selected];
         if (!e.dir && (e.isText || e.isKnownText)) {
@@ -574,16 +743,18 @@ void drawEntries(std::string &out, bool partial) {
 
             for (size_t l = 0; l < cached_preview_lines.size() && l < (size_t)visible; l++) {
                 appendCursor(out, l + 3, r_start);
+                
+                std::string num_str;
+                appendInt(num_str, l + 1);
+                
                 std::string pfx;
-                size_t line = l + 1;
-                if (line < 10)
-                    pfx += "  ";
-                else if (line < 100)
-                    pfx += " ";
-
-                appendInt(pfx, line);
-                pfx += " │ ";
-                int w = r_width - (int)pfx.size();
+                int pad = 3 - (int)num_str.length();
+                if (pad > 0) pfx.append(pad, ' ');
+                pfx += num_str + " │ ";
+                
+                // 3 dígitos numéricos + 1 espacio + 1 barra + 1 espacio = 6 de ancho visual
+                int w = r_width - 6; 
+                
                 out += "\x1b[90m" + pfx + "\x1b[0m";
                 appendTruncate(out, cached_preview_lines[l], w > 0 ? w : 0);
             }
@@ -592,10 +763,18 @@ void drawEntries(std::string &out, bool partial) {
 }
 
 void drawStatus(std::string &out) {
-    appendCursor(out, rows - 1, 1);
+    appendCursor(out, rows - 2, 1);
     out += "\x1b[90m";
     for (int i = 0; i < cols; i++) out += "─";
     out += "\x1b[0m\x1b[K";
+
+    appendCursor(out, rows - 1, 1);
+    out += "\x1b[K";
+    if (!entries.empty()) {
+        auto &e = entries[selected];
+        std::string info = "  Tamaño: " + getEntrySizeString(e) + "  │  Modificado: " + formatDate(e.mtime);
+        out += "\x1b[35m" + info + "\x1b[0m";
+    }
 
     appendCursor(out, rows, 1);
     out += "\x1b[K";
@@ -632,6 +811,23 @@ void drawStatus(std::string &out) {
     out += "\x1b[1m" + right + "\x1b[0m";
 }
 
+void drawHelp(std::string &out) {
+    out += "\x1b[H\x1b[2J"; 
+    out += "\x1b[1;1H\x1b[1m  AYUDA\x1b[0m\r\n";
+    out += "\x1b[2;1H\x1b[90m";
+    for (int i = 0; i < cols; i++) out += "─";
+    out += "\x1b[0m\x1b[K\x1b[3;1H\r\n  NAVEGACIÓN\r\n\r\n";
+    out += "  ↑ ↓     Mover selección\r\n  ←       Volver\r\n  →       Entrar directorio\r\n  ENTER   Abrir archivo\r\n\r\n";
+    out += "  COMANDOS\r\n\r\n  :       Entrar en modo comando\r\n  :n      Crear archivo\r\n  :r      Renombrar\r\n  :d      Eliminar\r\n";
+    out += "  m       Mover\r\n  c       Copiar\r\n  p       Pegar elemento marcado\r\n  /       Buscar recursivamente\r\n  //      Buscar desde origen\r\n";
+    out += "  u       Ver última fecha de modificación\r\n  s       Ver tamaño (suma recursiva en carpetas)\r\n";
+    out += "  h       Mostrar/Ocultar esta ayuda\r\n";
+    out += "  q       Salir\r\n  ESC     Cancelar\r\n\r\n";
+    out += "  PROGRAMAS UTILIZADOS\r\n\r\n";
+    const char *progs[][2] = {{"Texto", "nvim"}, {"C/C++", "nvim"}, {"Markdown", "nvim"}, {"JSON", "nvim"}, {"YAML", "nvim"}, {"XML", "nvim"}, {"HTML", "nvim"}, {"Makefile", "nvim"}, {"README", "nvim"}, {"LICENSE", "nvim"}, {"Imágenes", "wachar"}, {"PDF", "zathura"}, {"Vídeo", "mpv"}, {"Audio", "mpv"}};
+    for (const auto &p : progs) { out += "  "; out += p[0]; out += "\r\n    "; out += p[1]; out += "\r\n\r\n"; }
+}
+
 void refresh() {
     updateSize();
     g_out.clear();
@@ -639,39 +835,25 @@ void refresh() {
 
     g_out += "\x1b[?25l";
 
-    bool partial = !force_redraw && (scroll == prev_scroll) && (cwd == old_cwd);
+    if (helpMode) {
+        drawHelp(g_out);
+    } else {
+        bool partial = !force_redraw && (scroll == prev_scroll) && (cwd == old_cwd);
 
-    if (!partial) drawPath(g_out);
-    drawEntries(g_out, partial);
-    drawStatus(g_out);
+        if (!partial) drawPath(g_out);
+        drawEntries(g_out, partial);
+        drawStatus(g_out);
+    }
 
     ssize_t ign = write(STDOUT_FILENO, g_out.data(), g_out.size());
     (void)ign;
 
-    prev_selected = selected;
-    prev_scroll = scroll;
-    old_cwd = cwd;
+    if (!helpMode) {
+        prev_selected = selected;
+        prev_scroll = scroll;
+        old_cwd = cwd;
+    }
     force_redraw = false;
-}
-
-void showHelp() {
-    clear();
-    std::string out;
-    out.reserve(2048);
-    out += "\x1b[1;1H\x1b[1m  AYUDA\x1b[0m\r\n";
-    out += "\x1b[2;1H\x1b[90m";
-    for (int i = 0; i < cols; i++) out += "─";
-    out += "\x1b[0m\x1b[K\x1b[3;1H\r\n  NAVEGACIÓN\r\n\r\n";
-    out += "  ↑ ↓     Mover selección\r\n  ←       Volver\r\n  →       Entrar directorio\r\n  ENTER   Abrir archivo\r\n\r\n";
-    out += "  COMANDOS\r\n\r\n  :       Entrar en modo comando\r\n  :n      Crear archivo\r\n  :r      Renombrar\r\n  :d      Eliminar\r\n";
-    out += "  m       Mover\r\n  c       Copiar\r\n  p       Pegar elemento marcado\r\n  /       Buscar recursivamente\r\n  //      Buscar desde origen\r\n  q       Salir\r\n  ESC     Cancelar\r\n\r\n";
-    out += "  PROGRAMAS UTILIZADOS\r\n\r\n";
-    const char *progs[][2] = {{"Texto", "nvim"}, {"C/C++", "nvim"}, {"Markdown", "nvim"}, {"JSON", "nvim"}, {"YAML", "nvim"}, {"XML", "nvim"}, {"HTML", "nvim"}, {"Makefile", "nvim"}, {"README", "nvim"}, {"LICENSE", "nvim"}, {"Imágenes", "wachar"}, {"PDF", "zathura"}, {"Vídeo", "mpv"}, {"Audio", "mpv"}};
-    for (const auto &p : progs) { out += "  "; out += p[0]; out += "\r\n    "; out += p[1]; out += "\r\n\r\n"; }
-    ssize_t ign = write(STDOUT_FILENO, out.data(), out.size());
-    (void)ign;
-    readKey();
-    clear();
 }
 
 void clearClipboard() {
@@ -687,7 +869,6 @@ void reload() {
     if (selected >= entries.size()) selected = entries.size() - 1;
 }
 
-// --- Operaciones Mutables y Caché Interna ---
 void paste() {
     if (!clip.active) return;
     std::string dst = join(cwd, basename(clip.path));
@@ -719,7 +900,6 @@ void paste() {
     }
 }
 
-// --- Recursión de Búsqueda sin Allocaciones Redundantes ---
 bool recSearch(std::string &path_buf, size_t rel_idx, const std::string &query, std::string &result) {
     DIR *dir = opendir(path_buf.c_str());
     if (!dir) return false;
@@ -746,7 +926,7 @@ bool recSearch(std::string &path_buf, size_t rel_idx, const std::string &query, 
                 return true;
             }
         }
-        path_buf.resize(orig_len); // Rollback del buffer para evitar allocations adicionales
+        path_buf.resize(orig_len); 
     }
     closedir(dir);
     return false;
@@ -780,13 +960,15 @@ void search() {
         command = (double_slash ? "//" : "/") + text;
         refresh();
         int k = readKey();
+        if (k == KEY_NULL) continue; 
+        
         if (k == KEY_ESC) {
             commandMode = false;
             command.clear();
             if (cwd != orig_cwd && chdir(orig_cwd.c_str()) == 0) { updateCwd(); load(); }
             selected = orig_selected;
             if (selected < scroll) scroll = selected;
-            if (selected >= scroll + rows - 4) scroll = selected - (rows - 4) + 1;
+            if (selected >= scroll + rows - 5) scroll = selected - (rows - 5) + 1;
             force_redraw = true;
             return;
         }
@@ -820,7 +1002,7 @@ void search() {
                     if (entries[i].name == fname) {
                         selected = i;
                         if (selected < scroll) scroll = selected;
-                        if (selected >= scroll + rows - 4) scroll = selected - (rows - 4) + 1;
+                        if (selected >= scroll + rows - 5) scroll = selected - (rows - 5) + 1;
                         break;
                     }
                 }
@@ -829,7 +1011,7 @@ void search() {
             if (cwd != orig_cwd && chdir(orig_cwd.c_str()) == 0) { updateCwd(); load(); }
             selected = orig_selected;
             if (selected < scroll) scroll = selected;
-            if (selected >= scroll + rows - 4) scroll = selected - (rows - 4) + 1;
+            if (selected >= scroll + rows - 5) scroll = selected - (rows - 5) + 1;
         }
     }
 }
@@ -843,6 +1025,8 @@ void commandInput() {
     while (commandMode) {
         refresh();
         int k = readKey();
+        if (k == KEY_NULL) continue;
+        
         if (k == KEY_ESC) { commandMode = false; force_redraw = true; return; }
         if (k == KEY_BACKSPACE) {
             if (!command.empty()) { command.pop_back(); force_redraw = true; }
@@ -923,12 +1107,20 @@ void launch(const char *prog, const std::string &file) {
 
 void enter() {
     if (entries.empty() || !entries[selected].dir) return;
+    std::string target = entries[selected].name;
     historyPath.push_back(cwd);
     historyCursor.push_back(selected);
-    if (chdir(entries[selected].name.c_str()) == 0) {
+    if (chdir(target.c_str()) == 0) {
+        parentEntries = std::move(entries); 
         updateCwd();
         selected = 0; scroll = 0;
-        load();
+        entries = readDir(cwd);
+        childCachePath = "";
+        cached_preview_path = "";
+        force_redraw = true;
+    } else {
+        historyPath.pop_back();
+        historyCursor.pop_back();
     }
 }
 
@@ -936,17 +1128,28 @@ void back() {
     if (cwd == "/") return;
     std::string old = cwd;
     if (chdir("..") != 0) return;
+    
+    entries = std::move(parentEntries); 
     updateCwd();
-    load();
+    
+    if (cwd != "/") parentEntries = readDir(join(cwd, ".."));
+    else parentEntries.clear();
+    
+    childCachePath = "";
+    cached_preview_path = "";
+    force_redraw = true;
+    
     if (!historyPath.empty() && historyPath.back() == cwd) {
         selected = historyCursor.back();
         historyPath.pop_back();
         historyCursor.pop_back();
-        return;
+    } else {
+        for (size_t i = 0; i < entries.size(); i++) {
+            if (entries[i].path == old) { selected = i; break; }
+        }
     }
-    for (size_t i = 0; i < entries.size(); i++) {
-        if (entries[i].path == old) { selected = i; break; }
-    }
+    if (selected >= entries.size()) selected = entries.empty() ? 0 : entries.size() - 1;
+    if (scroll > selected) scroll = selected;
 }
 
 void markMove() {
@@ -980,7 +1183,19 @@ void open() {
 void loop() {
     while (running) {
         refresh();
-        switch (readKey()) {
+        int k = readKey();
+        if (k == KEY_NULL) continue; 
+        
+        if (helpMode) {
+            if (k == 'h' || k == KEY_ESC || k == 'q') {
+                if (k == 'q') running = false;
+                helpMode = false;
+                clear(); 
+            }
+            continue; 
+        }
+        
+        switch (k) {
             case 'q': running = false; break;
             case '/': search(); break;
             case KEY_ESC: clearClipboard(); break;
@@ -989,7 +1204,9 @@ void loop() {
             case 'm': markMove(); break;
             case 'c': markCopy(); break;
             case 'p': paste(); break;
-            case 'h': showHelp(); break;
+            case 'h': helpMode = true; force_redraw = true; break; 
+            case 'u': infoMode = (infoMode == INFO_DATE) ? INFO_NONE : INFO_DATE; force_redraw = true; break;
+            case 's': infoMode = (infoMode == INFO_SIZE) ? INFO_NONE : INFO_SIZE; force_redraw = true; break;
             case KEY_UP: if (selected) selected--; break;
             case KEY_DOWN: if (selected + 1 < entries.size()) selected++; break;
             case KEY_RIGHT: enter(); break;
@@ -1004,6 +1221,14 @@ int main() {
     updateCwd();
     load();
     clear();
+    
+    std::thread worker(sizeWorkerThread);
+    
     loop();
+    
+    workerRunning = false;
+    sizeCv.notify_all();
+    worker.join();
+    
     return 0;
 }
